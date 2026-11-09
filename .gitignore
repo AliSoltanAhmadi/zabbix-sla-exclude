@@ -4,3 +4,7 @@ __pycache__/
 .Python
 .venv/
 venv/
+verify-tui.py
+deploy-*.sh
+install-deps.sh
+sync-to-github-clone.sh

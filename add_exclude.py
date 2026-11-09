@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Append excluded downtime to all mapped SLAs for a short service name (e.g. Shop).
+Append excluded downtime to all 3 SLAs for a short service name (e.g. STS).
 
 Zabbix 6.4: sla.update replaces excluded_downtimes entirely, so this script
 fetches existing entries first, then appends the new window.
@@ -22,22 +22,17 @@ from zoneinfo import ZoneInfo
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_PATH = SCRIPT_DIR / ".env"
-# Fallback if .env has no timezone: line. Prefer setting timezone: in .env
-# Example: timezone: Asia/Tehran
-DEFAULT_TZ = "UTC"
+DEFAULT_TIMEZONE = "UTC"
 
 
 @dataclass
 class AppConfig:
     zabbix_address: str
     zabbix_token: str
-    timezone: str = DEFAULT_TZ
+    timezone_name: str = DEFAULT_TIMEZONE
+    tz: ZoneInfo = field(default_factory=lambda: ZoneInfo(DEFAULT_TIMEZONE))
     service_slas: dict[str, list[str]] = field(default_factory=dict)
     aliases: dict[str, str] = field(default_factory=dict)
-
-    @property
-    def tz(self) -> ZoneInfo:
-        return ZoneInfo(self.timezone)
 
 
 def _split_kv(line: str) -> tuple[str, str] | None:
@@ -53,8 +48,9 @@ def _split_kv(line: str) -> tuple[str, str] | None:
     return k.strip(), v.strip()
 
 
-def load_config(path: Path) -> AppConfig:
+def load_config(path: Path | str) -> AppConfig:
     """Load Zabbix credentials + service→SLA map from .env."""
+    path = Path(path)
     if not path.exists():
         raise FileNotFoundError(
             f".env not found: {path}\nCopy example.env to .env and set zabbix-address / zabbix-token."
@@ -91,13 +87,16 @@ def load_config(path: Path) -> AppConfig:
 
     zabbix_address = (flat.get("zabbix-address") or "").rstrip("/")
     zabbix_token = flat.get("zabbix-token") or ""
-    timezone = flat.get("timezone") or DEFAULT_TZ
+    timezone_name = (
+        flat.get("timezone")
+        or flat.get("zabbix-timezone")
+        or DEFAULT_TIMEZONE
+    ).strip() or DEFAULT_TIMEZONE
     try:
-        ZoneInfo(timezone)
+        tz = ZoneInfo(timezone_name)
     except Exception as e:
         raise ValueError(
-            f"Invalid timezone '{timezone}' in .env. "
-            "Use an IANA name, e.g. Asia/Tehran, UTC, Europe/London."
+            f"Invalid timezone in .env: {timezone_name!r}. Use an IANA name like UTC or Asia/Tehran."
         ) from e
 
     # Build service map: prefer order from `services:`; include any extra sla.* too
@@ -167,7 +166,8 @@ def load_config(path: Path) -> AppConfig:
     return AppConfig(
         zabbix_address=zabbix_address,
         zabbix_token=zabbix_token,
-        timezone=timezone,
+        timezone_name=timezone_name,
+        tz=tz,
         service_slas=service_slas,
         aliases=aliases,
     )
@@ -193,17 +193,18 @@ def zabbix_call(url: str, token: str, method: str, params, req_id: int = 1):
     return data["result"]
 
 
-def parse_local_datetime(value: str, tz: ZoneInfo) -> datetime:
-    """Parse YYYY-MM-DD HH:MM or YYYY-MM-DD HH:MM:SS in the configured timezone."""
+def parse_local_datetime(value: str, tz: ZoneInfo | None = None) -> datetime:
+    """Parse YYYY-MM-DD HH:MM or YYYY-MM-DD HH:MM:SS in the given timezone."""
+    zone = tz or ZoneInfo(DEFAULT_TIMEZONE)
     value = value.strip()
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
         try:
             naive = datetime.strptime(value, fmt)
-            return naive.replace(tzinfo=tz)
+            return naive.replace(tzinfo=zone)
         except ValueError:
             continue
     raise ValueError(
-        f"Invalid datetime '{value}'. Use: YYYY-MM-DD HH:MM  (timezone from .env)"
+        f"Invalid datetime '{value}'. Use: YYYY-MM-DD HH:MM  ({getattr(zone, 'key', zone)})"
     )
 
 
@@ -297,7 +298,9 @@ def append_exclude(
     end: datetime,
     explanation: str,
     dry_run: bool = False,
-) -> None:
+    quiet: bool = False,
+) -> list[str]:
+    """Apply excluded downtime. Returns log lines for CLI/TUI display."""
     if end <= start:
         raise ValueError("End time must be after start time.")
 
@@ -307,15 +310,14 @@ def append_exclude(
     slas = find_slas(api_url, cfg.zabbix_token, sla_names)
 
     new_entry = downtime_payload(explanation, period_from, period_to)
-
-    print(f"Service short name : {service}")
-    print(f"Name               : {explanation}")
-    print(f"Start time         : {start.strftime('%Y-%m-%d %H:%M')}  ({period_from})")
-    print(
+    lines: list[str] = [
+        f"Service short name : {service}",
+        f"Name               : {explanation}",
+        f"Start time         : {start.strftime('%Y-%m-%d %H:%M')}  ({period_from})",
         f"Duration           : {format_duration(period_to - period_from)}  "
-        f"(until {end.strftime('%Y-%m-%d %H:%M')})"
-    )
-    print()
+        f"(until {end.strftime('%Y-%m-%d %H:%M')})",
+        "",
+    ]
 
     for sla in slas:
         existing = existing_as_payload(sla.get("excluded_downtimes") or [])
@@ -325,14 +327,14 @@ def append_exclude(
             and e["period_to"] == new_entry["period_to"]
             for e in existing
         ):
-            print(
+            lines.append(
                 f"[skip] {sla['name']} (slaid={sla['slaid']}) — "
                 "identical exclude already present"
             )
             continue
 
         merged = existing + [new_entry]
-        print(
+        lines.append(
             f"[ok]   {sla['name']} (slaid={sla['slaid']}) — "
             f"keeping {len(existing)} existing + 1 new"
         )
@@ -349,10 +351,15 @@ def append_exclude(
             },
         )
 
+    lines.append("")
     if dry_run:
-        print("\nDry-run only — nothing was written to Zabbix.")
+        lines.append("Dry-run only — nothing was written to Zabbix.")
     else:
-        print("\nDone. Open SLA → Excluded downtimes in Zabbix to verify.")
+        lines.append("Done. Open SLA → Excluded downtimes in Zabbix to verify.")
+
+    if not quiet:
+        print("\n".join(lines))
+    return lines
 
 
 def format_duration(seconds: int) -> str:
@@ -409,19 +416,21 @@ def interactive(cfg: AppConfig) -> tuple[str, datetime, datetime, str]:
     """Prompt fields like Zabbix UI: Name, Start time, Duration (Days/Hours/Minutes)."""
     print("=" * 56)
     print("  New excluded downtime  (same fields as Zabbix UI)")
-    print(f"  Start time timezone: {cfg.timezone}  |  YYYY-MM-DD HH:MM")
+    print(f"  Start time: {cfg.timezone_name}  |  YYYY-MM-DD HH:MM")
     print("=" * 56)
     print("Services:", ", ".join(cfg.service_slas.keys()))
     print()
 
-    service = resolve_service(cfg, prompt("Service short name (e.g. Shop)"))
+    service = resolve_service(cfg, prompt("Service short name (e.g. AppOne)"))
     print()
     print("--- New excluded downtime ---")
     name = prompt("Name *  (short description)")
     if not name:
         raise ValueError("Name is required (short description of why this downtime).")
 
-    start = parse_local_datetime(prompt("Start time *  (YYYY-MM-DD HH:MM)"), cfg.tz)
+    start = parse_local_datetime(
+        prompt("Start time *  (YYYY-MM-DD HH:MM)"), cfg.tz
+    )
     print("Duration *")
     days = prompt_int("  Days", default=0, minimum=0)
     hours = prompt_int("  Hours", default=1, minimum=0, maximum=23)
@@ -444,12 +453,14 @@ def interactive(cfg: AppConfig) -> tuple[str, datetime, datetime, str]:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Add excluded downtime to all mapped SLAs for a service (Zabbix 6.4)."
+        description="Add excluded downtime to all 3 SLAs for a service (Zabbix 6.4)."
     )
     p.add_argument("--list", action="store_true", help="List short names and mapped SLAs")
-    p.add_argument("--service", "-s", help="Short name, e.g. Shop")
+    p.add_argument("--tui", action="store_true", help="Open Textual TUI (default when no CLI args)")
+    p.add_argument("--cli", action="store_true", help="Force classic interactive prompts")
+    p.add_argument("--service", "-s", help="Short name, e.g. STS")
     p.add_argument("--name", "-n", help="Name field (short description) — same as Zabbix UI")
-    p.add_argument("--start", help="Start time (timezone from .env): YYYY-MM-DD HH:MM")
+    p.add_argument("--start", help="Start time in .env timezone: YYYY-MM-DD HH:MM")
     p.add_argument("--days", type=int, default=None, help="Duration days (Zabbix UI)")
     p.add_argument("--hours", type=int, default=None, help="Duration hours 0-23 (Zabbix UI)")
     p.add_argument("--minutes", type=int, default=None, help="Duration minutes 0-59 (Zabbix UI)")
@@ -457,6 +468,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="Show what would be updated, do not write")
     p.add_argument("--env", type=Path, default=ENV_PATH, help="Path to .env")
     return p
+
+
+def launch_tui(env_path: Path) -> int:
+    try:
+        from tui import SlaExcludeApp
+    except ImportError as e:
+        print(
+            "ERROR: Textual TUI not available.\n"
+            "Install: python3 -m pip install --user 'textual>=0.47'\n"
+            f"Detail: {e}",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        cfg = load_config(env_path)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    if not cfg.zabbix_address or not cfg.zabbix_token or cfg.zabbix_token.startswith("your-"):
+        print("ERROR: .env must define real zabbix-address and zabbix-token.", file=sys.stderr)
+        return 1
+    SlaExcludeApp(cfg, env_path).run()
+    return 0
 
 
 def resolve_from_args(
@@ -492,6 +526,21 @@ def resolve_from_args(
 
 def main() -> int:
     args = build_parser().parse_args()
+
+    # No CLI payload and not --cli/--list → open TUI
+    wants_tui = args.tui or (
+        not args.cli
+        and not args.list
+        and not args.service
+        and not args.start
+        and not args.name
+        and not args.end
+        and args.days is None
+        and args.hours is None
+        and args.minutes is None
+    )
+    if wants_tui:
+        return launch_tui(args.env)
 
     try:
         cfg = load_config(args.env)

@@ -1,96 +1,70 @@
-# zabbix-sla-exclude
+# Zabbix SLA excluded downtime helper
 
-Python CLI for **Zabbix 6.4+**. Add one **Excluded downtime** window to **all SLAs** mapped to a short service name — typically monthly, overall, and quarterly — in a single run.
-
-No pip packages required (Python 3.9+, stdlib only).
-
----
-
-## Why this exists
-
-In Zabbix you often keep **several SLA objects per service** (e.g. monthly / overall / quarterly). Planned maintenance must be excluded from **each** of them, or reporting stays unfair.
-
-Doing that by hand in the UI is slow and easy to miss one SLA. This tool:
-
-1. Maps a short name (e.g. `Shop`) → exact SLA names from `.env`
-2. Fetches current excluded downtimes via API
-3. Appends your new window to **every** mapped SLA
-4. Writes back with `sla.update`
-
----
-
-## How it works
-
-```
-┌─────────────┐     ┌──────────────────┐     ┌─────────────────────────────┐
-│  You input  │────►│  Resolve short   │────►│  sla.get + existing         │
-│  short name │     │  name → SLA list │     │  excluded_downtimes         │
-│  + window   │     │  (from .env)     │     └──────────────┬──────────────┘
-└─────────────┘     └──────────────────┘                    │
-                                                            ▼
-                                               ┌─────────────────────────────┐
-                                               │  Append new window          │
-                                               │  (name, period_from/to)     │
-                                               └──────────────┬──────────────┘
-                                                              ▼
-                                               ┌─────────────────────────────┐
-                                               │  sla.update per SLA         │
-                                               │  (full list — keep old +    │
-                                               │   add new)                  │
-                                               └─────────────────────────────┘
-```
-
-**Important Zabbix detail:** `sla.update` **replaces** the entire `excluded_downtimes` list. This script always reads existing entries first, then sends **old + new**, so nothing is dropped.
-
-Interactive prompts mirror the Zabbix UI fields: **Name**, **Start time**, **Duration** (Days / Hours / Minutes).
-
----
+Python CLI + TUI for **Zabbix 6.4+**. Enter a short service name, start time, duration, and a short description — the tool appends that **excluded downtime** to every SLA mapped to that short name (for example monthly / overall / quarterly).
 
 ## Create a Zabbix API token
 
-1. Open Zabbix  
-2. **Users → API tokens** (or user profile → **API tokens**)  
-3. **Create API token** — use an Admin / Super admin that can edit SLAs  
-4. Copy the token once; store it only in `.env` as `zabbix-token`  
-5. Token must allow `sla.get` and `sla.update`
+1. Open your Zabbix UI  
+2. Go to **Users → API tokens** (menu labels vary by version)  
+3. **Create API token** for an **Admin** / **Super admin** that can edit SLAs  
+4. Copy the token (shown once) into `.env` as `zabbix-token`
 
----
+The token user must be allowed to call `sla.get` and `sla.update`.
 
 ## Setup
 
 ```bash
-cd /path/to/zabbix-sla-exclude
+git clone https://github.com/AliSoltanAhmadi/zabbix-sla-exclude.git
+cd zabbix-sla-exclude
 cp example.env .env
-# Edit .env: zabbix-address, zabbix-token, timezone, services / sla.*
+# edit .env: zabbix-address, zabbix-token, timezone, services / sla.* lines
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt   # needed for TUI (Textual)
 ```
 
-Never commit `.env` (see `.gitignore`).
+On Windows (PowerShell):
 
----
+```powershell
+python -m venv .venv
+.\.venv\Scripts\pip install -r requirements.txt
+```
+
+CLI one-liners work with system Python 3.9+ (stdlib only). The TUI needs the `.venv`.
 
 ## Usage
 
-### Interactive
+### TUI (default)
 
 ```bash
-python3 add_exclude.py
+./run-tui.sh
+# or
+.venv/bin/python add_exclude.py
+# or
+.venv/bin/python tui.py
 ```
 
-| Prompt | Zabbix UI field | Example |
-|--------|-----------------|---------|
-| Service short name | *(script only)* | `Shop` |
-| Name * | Name / short description | `ISP maintenance window` |
-| Start time * | Start time | `2026-10-16 00:00` |
-| Days / Hours / Minutes * | Duration | `0` / `1` / `0` |
+| Keys / controls | Action |
+|-----------------|--------|
+| Service list | pick a short name from `.env` |
+| Name / Start / Days·Hours·Minutes | same fields as the Zabbix UI |
+| `d` or **Dry-run** | preview, no write |
+| `a` or **Add / Apply** | write to all mapped SLAs |
+| `q` | quit |
 
-Start time uses the `timezone` from `.env` (IANA name, e.g. `Asia/Tehran`; fallback `UTC` if unset).
+Start times are interpreted in the `timezone` from `.env` (IANA name, e.g. `UTC` or `Asia/Tehran`).
 
-### One-liner
+### Classic prompts
+
+```bash
+python3 add_exclude.py --cli
+```
+
+### One-liner (non-interactive)
 
 ```bash
 python3 add_exclude.py \
-  --service Shop \
-  --name "ISP maintenance window" \
+  --service AppOne \
+  --name "planned network maintenance" \
   --start "2026-10-16 00:00" \
   --days 0 --hours 1 --minutes 0
 ```
@@ -98,51 +72,40 @@ python3 add_exclude.py \
 ### Dry-run (no write)
 
 ```bash
-python3 add_exclude.py --dry-run -s Shop \
+python3 add_exclude.py --dry-run -s AppOne \
   --name "test exclude" \
   --start "2026-10-16 00:00" \
   --hours 1
 ```
 
-### List mapped short names
+### List short names
 
 ```bash
 python3 add_exclude.py --list
 ```
 
----
+## Short name → SLAs (edit in `.env`)
 
-## Configure services in `.env`
-
-Services are **not hardcoded** — edit `.env`:
+Services are **not hardcoded** — configure them in `.env`:
 
 ```env
-services: Shop, Payments, API
+services: AppOne, AppTwo
 
-sla.Shop: Shop Services SLA | Shop Services Overall SLA | Shop Services Overall Quarterly
-sla.Payments: Payments Services SLA | Payments Services Overall SLA | Payments Services Overall Quarterly
-
-alias.pay: Payments
+sla.AppOne: AppOne Services SLA | AppOne Services Overall SLA | AppOne Services Overall Quarterly
+sla.AppTwo: AppTwo Services SLA | AppTwo Services Overall SLA | AppTwo Services Overall Quarterly
 ```
 
-- **Add:** append to `services:` and add a `sla.NewName:` line (exact Zabbix SLA names, `|`-separated)  
-- **Remove:** delete from `services:` (and optionally remove `sla.*`)  
-- **Aliases:** `alias.short: Canonical Name`
+- **Add a service:** append to `services:` and add a `sla.NewName:` line  
+- **Remove a service:** comment out / delete its `sla.*` line (and remove it from `services:`)  
+- Optional shortcuts: `alias.app1: AppOne`
 
----
+List current mapping: `python3 add_exclude.py --list`
 
-## Files
+## How it works
 
-| File | Purpose |
-|------|---------|
-| `add_exclude.py` | CLI |
-| `example.env` | Template for credentials + SLA map |
-| `.gitignore` | Ignores `.env` |
+1. Resolves short name → exact SLA names from `.env`  
+2. `sla.get` + `selectExcludedDowntimes` for each SLA  
+3. Appends your new window (`name`, `period_from`, `period_to`)  
+4. `sla.update` with the **full** list (Zabbix replaces the whole list — existing entries are kept)
 
----
-
-## Requirements
-
-- Python 3.9+
-- Zabbix 6.4+ (SLA API with `excluded_downtimes`)
-- Network access to your Zabbix URL
+This matches the Zabbix UI field **Excluded downtimes** → Name / Start / Duration.
